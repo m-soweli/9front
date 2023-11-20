@@ -1,782 +1,609 @@
-/*
- * omap3530 traps, exceptions, interrupts, system calls.
- */
 #include "u.h"
 #include "../port/lib.h"
 #include "mem.h"
 #include "dat.h"
 #include "fns.h"
 #include "../port/error.h"
+#include "../port/systab.h"
 
+#include "tos.h"
 #include "ureg.h"
-#include "arm.h"
 
-enum {
-	Nirqs = 96,
-	Nvec = 8,		/* # of vectors at start of lexception.s */
-	Bi2long = BI2BY * sizeof(long),
-};
+static volatile int probing;
+static volatile int probed;
 
-extern int notify(Ureg*);
-
-extern int ldrexvalid;
-
-/* omap35x intc (aka mpu_intc) */
-typedef struct Intrregs Intrregs;
-struct Intrregs {
-	/*
-	 * the manual inserts "INTCPS_" before each register name;
-	 * we'll just assume the prefix.
-	 */
-	uchar	_pad0[4*4];
-	ulong	sysconfig;
-	ulong	sysstatus;		/* ro */
-	uchar	_pad1[0x40 - 0x18];
-	ulong	sir_irq;		/* ro */
-	ulong	sir_fiq;		/* ro */
-	ulong	control;
-	ulong	protection;
-	ulong	idle;
-	uchar	_pad2[0x60 - 0x54];
-	ulong	irq_priority;
-	ulong	fiq_priority;
-	ulong	threshold;
-	uchar	_pad3[0x80 - 0x6c];
-	struct Bits {			/* bitmaps */
-		ulong	itr;		/* ro: pending intrs (no mask) */
-		ulong	mir;		/* interrupt mask: 1 means masked */
-		ulong	mir_clear;	/* wo: 1 sets the bit */
-		ulong	mir_set;	/* wo: 1 clears the bit */
-		ulong	isr_set;	/* software interrupts */
-		ulong	isr_clear;	/* wo */
-		ulong	pending_irq;	/* ro */
-		ulong	pending_fiq;	/* ro */
-	} bits[3];			/* 3*32 = 96 (Nirqs) */
-	ulong	ilr[Nirqs];
-};
-
-enum {
-	/* sysconfig bits */
-	Softreset	= 1<<1,
-
-	/* sysstatus bits */
-	Resetdone	= 1<<0,
-
-	/* sir_irq/fiq bits */
-	Activeirq	= MASK(7),
-
-	/* control bits */
-	Newirqagr	= 1<<0,
-
-	/* protection bits */
-	Protection	= 1<<0,
-
-	/* irq/fiq_priority bits */
-	Irqpriority	= MASK(6),
-
-	/* threshold bits */
-	Prioritythreshold = MASK(8),
-
-	/* ilr bits */
-	Priority	= MASK(8) - MASK(2),
-};
-
-typedef struct Vctl Vctl;
-typedef struct Vctl {
-	Vctl*	next;		/* handlers on this vector */
-	char	*name;		/* of driver, xallocated */
-	void	(*f)(Ureg*, void*);	/* handler to call */
-	void*	a;		/* argument to call it with */
-} Vctl;
-
-static Lock vctllock;
-static Vctl* vctl[Nirqs];
-
-/*
- *   Layout at virtual address 0.
- */
-typedef struct Vpage0 {
-	void	(*vectors[Nvec])(void);
-	u32int	vtable[Nvec];
-} Vpage0;
-static Vpage0 *vpage0;
-
-uvlong ninterrupt;
-uvlong ninterruptticks;
-int irqtooearly = 1;
-
-static volatile int probing, trapped;
-
-static int
-irqinuse(uint irq)
-{
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	/*
-	 * mir registers are odd: a 0 bit means intr unmasked (i.e.,
-	 * we've unmasked it because it's in use).
-	 */
-	return (ip->bits[irq / Bi2long].mir & (1 << (irq % Bi2long))) == 0;
-}
-
-static void
-intcmask(uint irq)
-{
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	ip->bits[irq / Bi2long].mir_set = 1 << (irq % Bi2long);
-	coherence();
-}
-
-static void
-intcunmask(uint irq)
-{
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	ip->bits[irq / Bi2long].mir_clear = 1 << (irq % Bi2long);
-	coherence();
-}
-
-static void
-intcmaskall(void)
-{
-	int i;
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	for (i = 0; i < 3; i++)
-		ip->bits[i].mir_set = ~0;
-	coherence();
-}
-
-static void
-intcunmaskall(void)
-{
-	int i;
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	for (i = 0; i < 3; i++)
-		ip->bits[i].mir_clear = ~0;
-	coherence();
-}
-
-static void
-intcinvertall(void)
-{
-	int i, s;
-	ulong bits;
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	s = splhi();
-	for (i = 0; i < 3; i++) {
-		bits = ip->bits[i].mir;
-		ip->bits[i].mir_set = ~0;	/* mask all */
-		coherence();
-		/* clearing enables only those intrs. that were disabled */
-		ip->bits[i].mir_clear = bits;
-	}
-	coherence();
-	splx(s);
-}
-
-static void
-intrsave(ulong buf[3])
-{
-	int i;
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	for (i = 0; i < nelem(buf); i++)
-		buf[i] = ip->bits[i].mir;
-	coherence();
-}
-
-static void
-intrrestore(ulong buf[3])
-{
-	int i, s;
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	s = splhi();
-	for (i = 0; i < nelem(buf); i++) {
-		ip->bits[i].mir_clear = ~0;	/* unmask all */
-		coherence();
-		ip->bits[i].mir_set = buf[i];	/* mask previously disabled */
-	}
-	coherence();
-	splx(s);
-}
-
-/*
- *  set up for exceptions
- */
 void
-trapinit(void)
+callwithureg(void (*f) (Ureg *))
 {
-	int i;
-	Intrregs *ip = (Intrregs *)PHYSINTC;
+	Ureg u;
 
-	/* set up the exception vectors */
-	vpage0 = (Vpage0*)HVECTORS;
-	memmove(vpage0->vectors, vectors, sizeof(vpage0->vectors));
-	memmove(vpage0->vtable, vtable, sizeof(vpage0->vtable));
-	cacheuwbinv();
-	l2cacheuwbinv();
-
-	/* set up the stacks for the interrupt modes */
-	setr13(PsrMfiq, m->sfiq);
-	setr13(PsrMirq, m->sirq);
-	setr13(PsrMabt, m->sabt);
-	setr13(PsrMund, m->sund);
-#ifdef HIGH_SECURITY
-	setr13(PsrMmon, m->smon);
-#endif
-	setr13(PsrMsys, m->ssys);
-
-	intcmaskall();
-	ip->control = 0;
-	ip->threshold = Prioritythreshold;	/* disable threshold */
-	for (i = 0; i < Nirqs; i++)
-		ip->ilr[i] = 0<<2 | 0;	/* all intrs pri 0 & to irq, not fiq */
-	irqtooearly = 0;
-	coherence();
+	u.pc = getcallerpc(&f);
+	u.sp = (uintptr) &f - 4;
+	f(&u);
 }
 
 void
-intrsoff(void)
+dumpstackureg(Ureg *ureg)
 {
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-
-	intcmaskall();
-	ip->control = Newirqagr;	/* dismiss interrupt */
-	coherence();
-}
-
-/*
- *  enable an irq interrupt
- */
-int
-irqenable(int irq, void (*f)(Ureg*, void*), void* a, char *name)
-{
-	Vctl *v;
-
-	if(irq >= nelem(vctl) || irq < 0)
-		panic("irqenable irq %d", irq);
-
-	if (irqtooearly) {
-		iprint("irqenable for %d %s called too early\n", irq, name);
-		return -1;
-	}
-	if(irqinuse(irq))
-		print("irqenable: %s: irq %d already in use, chaining\n",
-			name, irq);
-	v = malloc(sizeof(Vctl));
-	if (v == nil)
-		panic("irqenable: malloc Vctl");
-	v->f = f;
-	v->a = a;
-	v->name = malloc(strlen(name)+1);
-	if (v->name == nil)
-		panic("irqenable: malloc name");
-	strcpy(v->name, name);
-
-	lock(&vctllock);
-	v->next = vctl[irq];
-	vctl[irq] = v;
-
-	intcunmask(irq);
-	unlock(&vctllock);
-	return 0;
-}
-
-/*
- *  disable an irq interrupt
- */
-int
-irqdisable(int irq, void (*f)(Ureg*, void*), void* a, char *name)
-{
-	Vctl **vp, *v;
-
-	if(irq >= nelem(vctl) || irq < 0)
-		panic("irqdisable irq %d", irq);
-
-	lock(&vctllock);
-	for(vp = &vctl[irq]; v = *vp; vp = &v->next)
-		if (v->f == f && v->a == a && strcmp(v->name, name) == 0){
-			print("irqdisable: remove %s\n", name);
-			*vp = v->next;
-			free(v);
-			break;
-		}
-
-	if(v == nil)
-		print("irqdisable: irq %d, name %s not enabled\n", irq, name);
-	if(vctl[irq] == nil){
-		print("irqdisable: clear icmr bit %d\n", irq);
-		intcmask(irq);
-	}
-	unlock(&vctllock);
-
-	return 0;
-}
-
-/*
- *  called by trap to handle access faults
- */
-static void
-faultarm(Ureg *ureg, uintptr va, int user, int read)
-{
-	int n, insyscall;
-	char buf[ERRMAX];
-
-	if(up == nil) {
-		dumpregs(ureg);
-		panic("fault: nil up in faultarm, accessing %#p", va);
-	}
-	insyscall = up->insyscall;
-	up->insyscall = 1;
-	n = fault(va, ureg->pc, read);
-	if(n < 0){
-		if(!user){
-			dumpregs(ureg);
-			panic("fault: kernel accessing %#p", va);
-		}
-		/* don't dump registers; programs suicide all the time */
-		snprint(buf, sizeof buf, "sys: trap: fault %s va=%#p",
-			read? "read": "write", va);
-		postnote(up, 1, buf, NDebug);
-	}
-	up->insyscall = insyscall;
-}
-
-/*
- *  called by trap to handle interrupts.
- *  returns true iff a clock interrupt, thus maybe reschedule.
- */
-static int
-irq(Ureg* ureg)
-{
-	int clockintr;
-	uint irqno, handled, t, ticks = perfticks();
-	Intrregs *ip = (Intrregs *)PHYSINTC;
-	Vctl *v;
-	static int nesting, lastirq = -1;
-
-	handled = 0;
-	irqno = ip->sir_irq & Activeirq;
-
-	if (irqno >= 37 && irqno <= 47)		/* this is a clock intr? */
-		m->inclockintr++;		/* yes, count nesting */
-	lastirq = irqno;
-
-	if (irqno >= nelem(vctl)) {
-		iprint("trap: irq %d >= # vectors (%d)\n", irqno, nelem(vctl));
-		ip->control = Newirqagr;	/* dismiss interrupt */
-		return 0;
-	}
-
-	++nesting;
-	for(v = vctl[irqno]; v != nil; v = v->next)
-		if (v->f) {
-			if (islo())
-				panic("trap: pl0 before trap handler for %s",
-					v->name);
-			v->f(ureg, v->a);
-			if (islo())
-				panic("trap: %s lowered pl", v->name);
-//			splhi();		/* in case v->f lowered pl */
-			handled++;
-		}
-	if(!handled) {
-		iprint("unexpected interrupt: irq %d", irqno);
-		switch (irqno) {
-		case 56:
-		case 57:
-			iprint(" (I⁲C)");
-			break;
-		case 83:
-		case 86:
-		case 94:
-			iprint(" (MMC)");
-			break;
-		}
-
-		if(irqno < nelem(vctl)) {
-			intcmask(irqno);
-			iprint(", now masked");
-		}
-		iprint("\n");
-	}
-	t = perfticks();
-	ninterrupt++;
-	if(t < ticks)
-		ninterruptticks += ticks-t;
-	else
-		ninterruptticks += t-ticks;
-	ip->control = Newirqagr;	/* dismiss interrupt */
-	coherence();
-
-	--nesting;
-	clockintr = m->inclockintr == 1;
-	if (irqno >= 37 && irqno <= 47)
-		m->inclockintr--;
-	return clockintr;
-}
-
-/*
- *  returns 1 if the instruction writes memory, 0 otherwise
- */
-int
-writetomem(ulong inst)
-{
-	/* swap always write memory */
-	if((inst & 0x0FC00000) == 0x01000000)
-		return 1;
-
-	/* loads and stores are distinguished by bit 20 */
-	if(inst & (1<<20))
-		return 0;
-
-	return 1;
-}
-
-void	prgpmcerrs(void);
-
-/*
- *  here on all exceptions other than syscall (SWI)
- */
-void
-trap(Ureg *ureg)
-{
-	int user, x, rv, rem;
-	ulong inst, fsr;
-	uintptr va;
-	char buf[ERRMAX];
-
-	splhi();			/* paranoia */
-	if(up != nil)
-		rem = ((char*)ureg)-((char*)up-KSTACK);
-	else
-		rem = ((char*)ureg)-((char*)m+sizeof(Mach));
-	if(rem < 1024) {
-		iprint("trap: %d stack bytes left, up %#p ureg %#p at pc %#lux\n",
-			rem, up, ureg, ureg->pc);
-		delay(1000);
-		dumpstack();
-		panic("trap: %d stack bytes left, up %#p ureg %#p at pc %#lux",
-			rem, up, ureg, ureg->pc);
-	}
-
-	user = kenter(ureg);
-	/*
-	 * All interrupts/exceptions should be resumed at ureg->pc-4,
-	 * except for Data Abort which resumes at ureg->pc-8.
-	 */
-	if(ureg->type == (PsrMabt+1))
-		ureg->pc -= 8;
-	else
-		ureg->pc -= 4;
-
-	switch(ureg->type){
-	default:
-		panic("unknown trap; type %#lux, psr mode %#lux", ureg->type,
-			ureg->psr & PsrMask);
-		break;
-	case PsrMirq:
-		ldrexvalid = 0;
-		if(!irq(ureg))
-			preempted();
-		else if(up != nil && up->delaysched){
-			ldrexvalid = 0;
-			sched();
-		}
-		m->intr++;
-		break;
-	case PsrMabt:			/* prefetch fault */
-		ldrexvalid = 0;
-		x = ifsrget();
-		fsr = (x>>7) & 0x8 | x & 0x7;
-		switch(fsr){
-		case 0x02:		/* instruction debug event (BKPT) */
-			if(user){
-				snprint(buf, sizeof buf, "sys: breakpoint");
-				postnote(up, 1, buf, NDebug);
-			}else{
-				iprint("kernel bkpt: pc %#lux inst %#ux\n",
-					ureg->pc, *(u32int*)ureg->pc);
-				panic("kernel bkpt");
-			}
-			break;
-		default:
-			faultarm(ureg, ureg->pc, user, 1);
-			break;
-		}
-		break;
-	case PsrMabt+1:			/* data fault */
-		ldrexvalid = 0;
-		va = farget();
-		inst = *(ulong*)(ureg->pc);
-		/* bits 12 and 10 have to be concatenated with status */
-		x = fsrget();
-		fsr = (x>>7) & 0x20 | (x>>6) & 0x10 | x & 0xf;
-		if (probing && !user) {
-			if (trapped++ > 0)
-				panic("trap: recursive probe %#lux", va);
-			ureg->pc += 4;	/* continue at next instruction */
-			break;
-		}
-		switch(fsr){
-		default:
-		case 0xa:		/* ? was under external abort */
-			panic("unknown data fault, 6b fsr %#lux", fsr);
-			break;
-		case 0x0:
-			panic("vector exception at %#lux", ureg->pc);
-			break;
-		case 0x1:		/* alignment fault */
-		case 0x3:		/* access flag fault (section) */
-			if(user){
-				snprint(buf, sizeof buf,
-					"sys: alignment: pc %#lux va %#p\n",
-					ureg->pc, va);
-				postnote(up, 1, buf, NDebug);
-			} else
-				panic("kernel alignment: pc %#lux va %#p", ureg->pc, va);
-			break;
-		case 0x2:
-			panic("terminal exception at %#lux", ureg->pc);
-			break;
-		case 0x4:		/* icache maint fault */
-		case 0x6:		/* access flag fault (page) */
-		case 0x8:		/* precise external abort, non-xlat'n */
-		case 0x28:
-		case 0xc:		/* l1 translation, precise ext. abort */
-		case 0x2c:
-		case 0xe:		/* l2 translation, precise ext. abort */
-		case 0x2e:
-		case 0x16:		/* imprecise ext. abort, non-xlt'n */
-		case 0x36:
-			panic("external abort %#lux pc %#lux addr %#p",
-				fsr, ureg->pc, va);
-			break;
-		case 0x1c:		/* l1 translation, precise parity err */
-		case 0x1e:		/* l2 translation, precise parity err */
-		case 0x18:		/* imprecise parity or ecc err */
-			panic("translation parity error %#lux pc %#lux addr %#p",
-				fsr, ureg->pc, va);
-			break;
-		case 0x5:		/* translation fault, no section entry */
-		case 0x7:		/* translation fault, no page entry */
-			faultarm(ureg, va, user, !writetomem(inst));
-			break;
-		case 0x9:
-		case 0xb:
-			/* domain fault, accessing something we shouldn't */
-			if(user){
-				snprint(buf, sizeof buf,
-					"sys: access violation: pc %#lux va %#p\n",
-					ureg->pc, va);
-				postnote(up, 1, buf, NDebug);
-			} else
-				panic("kernel access violation: pc %#lux va %#p",
-					ureg->pc, va);
-			break;
-		case 0xd:
-		case 0xf:
-			/* permission error, copy on write or real permission error */
-			faultarm(ureg, va, user, !writetomem(inst));
-			break;
-		}
-		break;
-	case PsrMund:			/* undefined instruction */
-		if(user){
-			if(seg(up, ureg->pc, 0) != nil &&
-			   *(u32int*)ureg->pc == 0xD1200070){
-				snprint(buf, sizeof buf, "sys: breakpoint");
-				postnote(up, 1, buf, NDebug);
-			}else{
-				/* look for floating point instructions to interpret */
-				x = spllo();
-				rv = fpiarm(ureg);
-				splx(x);
-				if(rv == 0){
-					ldrexvalid = 0;
-					snprint(buf, sizeof buf,
-						"undefined instruction: pc %#lux\n",
-						ureg->pc);
-					postnote(up, 1, buf, NDebug);
-				}
-			}
-		}else{
-			if (ureg->pc & 3) {
-				iprint("rounding fault pc %#lux down to word\n",
-					ureg->pc);
-				ureg->pc &= ~3;
-			}
-			iprint("undefined instruction: pc %#lux inst %#ux\n",
-				ureg->pc, ((u32int*)ureg->pc)[-2]);
-			panic("undefined instruction");
-		}
-		break;
-	}
-	splhi();
-	if(user){
-		if(up->procctl || up->nnote)
-			notify(ureg);
-		kexit(ureg);
-	}
-}
-
-/*
- * Fill in enough of Ureg to get a stack trace, and call a function.
- * Used by debugging interface rdb.
- */
-void
-callwithureg(void (*fn)(Ureg*))
-{
-	Ureg ureg;
-
-	ureg.pc = getcallerpc(&fn);
-	ureg.sp = (uintptr)&fn;
-	fn(&ureg);
-}
-
-static void
-dumpstackwithureg(Ureg *ureg)
-{
-	int x;
 	uintptr l, v, i, estack;
-	char *s;
-
-	dumpregs(ureg);
-	if((s = getconf("*nodumpstack")) != nil && strcmp(s, "0") != 0){
-		iprint("dumpstack disabled\n");
-		return;
-	}
-	iprint("dumpstack\n");
+	int x;
 
 	x = 0;
-	x += iprint("ktrace /kernel/path %#.8lux %#.8lux %#.8lux # pc, sp, link\n",
+	x += iprint("ktrace /arm/9n900 %#.8lux %#.8lux %#.8lux <<EOF\n",
 		ureg->pc, ureg->sp, ureg->r14);
-	delay(20);
-	i = 0;
-	if(up
-	&& (uintptr)&l >= (uintptr)up - KSTACK
-	&& (uintptr)&l <= (uintptr)up)
-		estack = (uintptr)up;
-	else if((uintptr)&l >= (uintptr)m->stack
-	&& (uintptr)&l <= (uintptr)m+MACHSIZE)
-		estack = (uintptr)m+MACHSIZE;
-	else
-		return;
-	x += iprint("estackx %p\n", estack);
 
-	for(l = (uintptr)&l; l < estack; l += sizeof(uintptr)){
+	i = 0;
+	if(up)
+		estack = (uintptr)up;
+	else
+		estack = (uintptr)m+MACHSZ;
+
+	x += iprint("estackx %p\n", estack);
+	for(l = (uintptr)&l; l < estack; l += sizeof(uintptr)) {
 		v = *(uintptr*)l;
-		if((KTZERO < v && v < (uintptr)etext) || estack-l < 32){
-			x += iprint("%.8p ", v);
-			delay(20);
+		if((KTZERO < v && v < (uintptr)etext) || estack-l < 32) {
+			x += iprint("%.8p=%.8p ", l, v);
 			i++;
 		}
-		if(i == 8){
+
+		if(i == 4) {
 			i = 0;
 			x += iprint("\n");
-			delay(20);
 		}
 	}
+
 	if(i)
 		iprint("\n");
+	iprint("EOF\n");
 }
 
 void
 dumpstack(void)
 {
-	callwithureg(dumpstackwithureg);
-}
-
-/*
- * dump system control coprocessor registers
- */
-static void
-dumpscr(void)
-{
-	iprint("0:\t%#8.8ux id\n", cpidget());
-	iprint("\t%8.8#ux ct\n", cpctget());
-	iprint("1:\t%#8.8ux control\n", controlget());
-	iprint("2:\t%#8.8ux ttb\n", ttbget());
-	iprint("3:\t%#8.8ux dac\n", dacget());
-	iprint("4:\t(reserved)\n");
-	iprint("5:\t%#8.8ux fsr\n", fsrget());
-	iprint("6:\t%#8.8ux far\n", farget());
-	iprint("7:\twrite-only cache\n");
-	iprint("8:\twrite-only tlb\n");
-	iprint("13:\t%#8.8ux pid\n", pidget());
-	delay(10);
-}
-
-/*
- * dump general registers
- */
-static void
-dumpgpr(Ureg* ureg)
-{
-	if(up != nil)
-		iprint("cpu%d: registers for %s %lud\n",
-			m->machno, up->text, up->pid);
-	else
-		iprint("cpu%d: registers for kernel\n", m->machno);
-
-	delay(20);
-	iprint("%#8.8lux\tr0\n", ureg->r0);
-	iprint("%#8.8lux\tr1\n", ureg->r1);
-	iprint("%#8.8lux\tr2\n", ureg->r2);
-	delay(20);
-	iprint("%#8.8lux\tr3\n", ureg->r3);
-	iprint("%#8.8lux\tr4\n", ureg->r4);
-	iprint("%#8.8lux\tr5\n", ureg->r5);
-	delay(20);
-	iprint("%#8.8lux\tr6\n", ureg->r6);
-	iprint("%#8.8lux\tr7\n", ureg->r7);
-	iprint("%#8.8lux\tr8\n", ureg->r8);
-	delay(20);
-	iprint("%#8.8lux\tr9 (up)\n", ureg->r9);
-	iprint("%#8.8lux\tr10 (m)\n", ureg->r10);
-	iprint("%#8.8lux\tr11 (loader temporary)\n", ureg->r11);
-	iprint("%#8.8lux\tr12 (SB)\n", ureg->r12);
-	delay(20);
-	iprint("%#8.8lux\tr13 (sp)\n", ureg->r13);
-	iprint("%#8.8lux\tr14 (link)\n", ureg->r14);
-	iprint("%#8.8lux\tr15 (pc)\n", ureg->pc);
-	delay(20);
-	iprint("%10.10lud\ttype\n", ureg->type);
-	iprint("%#8.8lux\tpsr\n", ureg->psr);
-	delay(20);
+	callwithureg(dumpstackureg);
 }
 
 void
-dumpregs(Ureg* ureg)
+dumpureg(Ureg *ureg)
 {
-	dumpgpr(ureg);
-	dumpscr();
+	if(up)
+		iprint("cpu%d: registers for %s %lud\n", m->machno, up->text, up->pid);
+	else
+		iprint("cpu%d: registers for kernel\n", m->machno);
+
+	iprint("r0 %#.8lux\tr1 %#.8lux\tr2 %#.8lux\tr3 %#.8lux\n", ureg->r0, ureg->r1, ureg->r2, ureg->r3);
+	iprint("r4 %#.8lux\tr5 %#.8lux\tr6 %#.8lux\tr7 %#.8lux\n", ureg->r4, ureg->r5, ureg->r6, ureg->r7);
+	iprint("r8 %#.8lux\tr9 %#.8lux\tr10 %#.8lux\tr11 %#.8lux\n", ureg->r8, ureg->r9, ureg->r10, ureg->r11);
+	iprint("r12 %#.8lux\tr13 %#.8lux\tr14 %#.8lux\tr15 %#.8lux\n", ureg->r12, ureg->r13, ureg->r14, ureg->pc);
 }
 
-vlong
-probeaddr(uintptr addr)
+
+uintptr
+userpc(void)
 {
-	vlong v;
-	static Lock fltlck;
+	return ((Ureg*)up->dbgreg)->pc;
+}
 
-	ilock(&fltlck);
-	trapped = 0;
+uintptr
+dbgpc(Proc *)
+{
+	if(up->dbgreg)
+		return userpc();
+
+	return 0;
+}
+
+void
+procsetup(Proc *p)
+{
+	p->fpstate = FPinit;
+	fpoff();
+}
+
+void
+procsave(Proc *p)
+{
+	if(p->fpstate == FPactive) {
+		if(p->state == Moribund)
+			fpclear();
+		else
+			fpsave(p->fpsave);
+		p->fpstate = FPinactive;
+	}
+}
+
+void
+procrestore(Proc *)
+{
+}
+
+void
+procfork(Proc *p)
+{
+	ulong s;
+
+	s = splhi();
+	switch(up->fpstate & ~FPillegal) {
+	case FPactive:
+		fpsave(up->fpsave);
+		up->fpstate = FPinactive;
+	case FPinactive:
+		memmove(p->fpsave, up->fpsave, sizeof(FPsave));
+		p->fpstate = FPinactive;
+	}
+
+	splx(s);
+}
+
+void
+kprocchild(Proc *p, void (*entry)(void))
+{
+	p->sched.pc = (uintptr) entry;
+	p->sched.sp = (uintptr) p;
+}
+
+void
+forkchild(Proc *p, Ureg *ureg)
+{
+	Ureg *cureg;
+
+	p->sched.sp = (uintptr) p - sizeof(Ureg);
+	p->sched.pc = (uintptr) forkret;
+
+	cureg = (Ureg*) p->sched.sp;
+	memmove(cureg, ureg, sizeof(Ureg));
+	cureg->r0 = 0;
+}
+
+uintptr
+execregs(uintptr entry, ulong ssize, ulong nargs)
+{
+	ulong *sp;
+	Ureg *ureg;
+
+	sp = (ulong*)(USTKTOP - ssize); *--sp = nargs;
+	ureg = up->dbgreg;
+	ureg->sp = (uintptr) sp;
+	ureg->pc = entry;
+	ureg->r14 = 0;
+
+	return USTKTOP-sizeof(Tos);
+}
+
+void
+setkernur(Ureg *ureg, Proc *p)
+{
+	ureg->pc = p->sched.pc;
+	ureg->sp = p->sched.sp+4;
+	ureg->r14 = (uintptr) sched;
+}
+
+void
+setregisters(Ureg *ureg, char *pureg, char *uva, int n)
+{
+	uvlong v;
+
+	v = ureg->psr;
+	memmove(pureg, uva, n);
+	ureg->psr &= ~(PsrMask|PsrDfiq|PsrDirq);
+	ureg->psr |= v & (PsrMask|PsrDfiq|PsrDirq);
+}
+
+void
+evenaddr(uintptr addr)
+{
+	if(addr & 3) {
+		postnote(up, 1, "sys: odd address", NDebug);
+		error(Ebadarg);
+	}
+}
+
+int
+notify(Ureg *ureg)
+{
+	ulong s, sp;
+	char *msg;
+
+	if(up->procctl)
+		procctl();
+	if(up->nnote == 0)
+		return 0;
+	
+	if(up->fpstate == FPactive) {
+		fpsave(up->fpsave);
+		up->fpstate = FPinactive;
+	}
+	up->fpstate |= FPillegal;
+
+	s = spllo();
+	qlock(&up->debug);
+	msg = popnote(ureg);
+	if(msg == nil) {
+		qunlock(&up->debug);
+		splhi();
+		return 0;
+	}
+
+	sp = ureg->sp;
+	sp -= 256;
+	sp -= sizeof(Ureg);
+
+	if(!okaddr((uintptr)up->notify, 1, 0)
+	|| !okaddr(sp-ERRMAX-4*BY2WD, sizeof(Ureg)+ERRMAX+4*BY2WD, 1)
+	|| ((uintptr) up->notify & 3) != 0
+	|| (sp & 3) != 0) {
+		qunlock(&up->debug);
+		pprint("suicide: bad address in notify\n");
+		pexit("Suicide", 0);
+	}
+
+	memmove((Ureg*)sp, ureg, sizeof(Ureg));
+	*(Ureg**)(sp-BY2WD) = up->ureg;
+	up->ureg = (void*)sp;
+	sp -= BY2WD+ERRMAX;
+	memmove((char*)sp, msg, ERRMAX);
+	sp -= 3*BY2WD;
+	*(uintptr*)(sp+2*BY2WD) = sp+3*BY2WD;
+	*(uintptr*)(sp+1*BY2WD) = (uintptr)up->ureg;
+	ureg->r0 = (uintptr) up->ureg;
+	ureg->sp = sp;
+	ureg->pc = (uintptr) up->notify;
+	ureg->r14 = 0;
+
+	qunlock(&up->debug);
+	splx(s);
+	return 1;
+}
+
+void
+noted(Ureg *ureg, ulong arg0)
+{
+	Ureg *nureg;
+	ulong oureg, sp;
+
+	qlock(&up->debug);
+	if(arg0 != NRSTR && !up->notified) {
+		qunlock(&up->debug);
+		iprint("called to noted when not notified\n");
+		pexit("Suicide", 0);
+	}
+
+	up->notified = 0;
+	up->fpstate &= ~FPillegal;
+	nureg = up->ureg;
+	oureg = (ulong) nureg;
+	if(!okaddr(oureg - BY2WD, BY2WD + sizeof(Ureg), 0) || (oureg & 3) != 0) {
+		qunlock(&up->debug);
+		pprint("bad ureg in noted or call to noted when not notifed\n");
+		pexit("Suicide", 0);
+	}
+
+	nureg->psr &= PsrMask|PsrDfiq|PsrDirq;
+	nureg->psr |= (ureg->psr & ~(PsrMask|PsrDfiq|PsrDirq));
+
+	memmove(ureg, nureg, sizeof(Ureg));
+	switch(arg0) {
+	case NCONT:
+	case NRSTR:
+		if(!okaddr(nureg->pc, BY2WD, 0) || (nureg->pc & 3) != 0
+		|| !okaddr(nureg->sp, BY2WD, 0) || (nureg->sp & 3) != 0) {
+			qunlock(&up->debug);
+			pprint("suicide: trap in noted\n");
+			pexit("Suicide", 0);
+		}
+
+		up->ureg = (Ureg *) (*(ulong*) (oureg - BY2WD));
+		qunlock(&up->debug);
+		break;
+
+	case NSAVE:
+		if(!okaddr(nureg->pc, BY2WD, 0) || (nureg->pc & 3) != 0
+		|| !okaddr(nureg->sp, BY2WD, 0) || (nureg->sp & 3) != 0) {
+			qunlock(&up->debug);
+			pprint("suicide: trap in noted\n");
+			pexit("Suicide", 0);
+		}
+
+		qunlock(&up->debug);
+		sp = oureg - 4 * BY2WD - ERRMAX;
+		splhi();
+		ureg->sp = sp;
+		ureg->r0 = (uintptr) oureg;
+		((ulong*) sp)[1] = oureg;
+		((ulong*) sp)[0] = 0;
+		break;
+
+	default:
+		up->lastnote->flag = NDebug;
+		/* wet floor */
+
+	case NDFLT:
+		qunlock(&up->debug);
+		if(up->lastnote->flag == NDebug)
+			pprint("suicide: %s\n", up->lastnote->msg);
+
+		pexit(up->lastnote->msg, up->lastnote->flag != NDebug);
+		break;
+	}
+}
+
+void
+trapinit(void)
+{
+	extern ulong vectors[];
+
+	/* install stack pointer for other exception modes */
+	setR13(PsrMfiq, m->save);
+	setR13(PsrMirq, m->save);
+	setR13(PsrMiabt, m->save);
+	setR13(PsrMund, m->save);
+	setR13(PsrMsys, m->save);
+
+	/* install vectors and vtable to MACHVEC because vectors must be
+	 * aligned on a 128 byte boundary */
+	memmove((ulong*)MACHVEC(m->machno), vectors, 64 * 4);
+
+	/* set vectors base address */
+	setvectors(MACHVEC(m->machno));
+}
+
+static void
+trapfpu(void)
+{
+	int s;
+
+	if((up->fpstate & FPillegal) != 0) {
+		postnote(up, 1, "sys: floating point in note handler", NDebug);
+		return;
+	}
+
+	switch(up->fpstate) {
+	case FPinit:
+		s = splhi();
+		fpinit(); up->fpstate = FPactive;
+		splx(s);
+		break;
+
+	case FPinactive:
+		s = splhi();
+		fprestore(up->fpsave); up->fpstate = FPactive;
+		splx(s);
+		break;
+
+	case FPactive:
+		postnote(up, 1, "sys: floating point error", NDebug);
+		break;
+	}
+}
+
+static void
+traparm(Ureg *ureg, ulong fsr, uintptr far)
+{
+	int user;
+	int read;
+	int syscall;
+
+	static char buf[ERRMAX];
+
+	read = (fsr & (1<<11)) == 0;
+	user = userureg(ureg);
+	if(!user) {
+		if(far >= USTKTOP)
+			panic("kernel fault: bad address pc=%#.8lux far=%#.8lux fsr=%#.8lux",
+				ureg->pc, far, fsr);
+		if(up == nil)
+			panic("kernel fault: no user process pc=%#.8lux far=%#.8lux fsr=%#.8lux",
+				ureg->pc, far, fsr);
+	}
+
+	if(up == nil) {
+		panic("user fault: up=nil pc=%#.8lux far=%#.8lux fsr=%#.8lux",
+			ureg->pc, far, fsr);
+	}
+
+	syscall = up->insyscall; up->insyscall = 1;
+	switch(fsr & 0x1f) {
+	case 0x03: /* l1 access flag fault */
+	case 0x05: /* l1 translation fault */
+	case 0x06: /* l2 access flag fault */
+	case 0x07: /* l2 translation fault */
+	case 0x09: /* l1 domain fault */
+	case 0x0b: /* l2 domain fault */
+	case 0x0d: /* l1 permission fault */
+	case 0x0f: /* l2 permission fault */
+		if(fault(far, ureg->pc, read) == 0)
+			break;
+
+	default:
+		if(!user)
+			panic("kernel fault: pc=%#.8lux far=%#.8lux fsr=%#.8lux",
+				ureg->pc, far, fsr);
+
+		dumpureg(ureg);
+		dumpstackureg(ureg);
+		snprint(buf, sizeof(buf), "sys: trap: fault %s far=%#.8lux fsr=%#.8lux",
+			read ? "read" : "write", far, fsr);
+		postnote(up, 1, buf, NDebug);
+	}
+
+	up->insyscall = syscall;
+}
+
+void
+trap(Ureg *ureg)
+{
+	int user;
+	u32int op, cp;
+
+	user = kenter(ureg);
+	switch(ureg->type) {
+	case PsrMfiq:
+	case PsrMirq:
+		ureg->pc -= 4;
+		intr(ureg);
+		break;
+
+	case PsrMiabt:
+		ureg->pc -= 4;
+		traparm(ureg, getifsr(), getifar());
+		break;
+
+	case PsrMdabt:
+		ureg->pc -= 8;
+		if(probing && !user) {
+			ureg->pc += 4;
+			probed = 0;
+			goto out;
+		}
+
+		traparm(ureg, getdfsr(), getdfar());
+		break;
+
+	case PsrMund:
+		ureg->pc -= 4;
+		if(user) {
+			spllo();
+			if(okaddr(ureg->pc, 4, 0)) {
+				op = *(u32int*)ureg->pc;
+				if((op & 0x0f000000) == 0x0e000000 || (op & 0x0e000000) == 0x0c000000) {
+					cp = op >> 8 & 15;
+					if(cp == 10 || cp == 11) {
+						trapfpu();
+						break;
+					}
+				}
+			}
+				
+			postnote(up, 1, "sys: trap: invalid opcode", NDebug);
+			break;
+		}
+
+		panic("invalid opcode at pc=%#.8lux lr=%#.8lux", ureg->pc, ureg->r14);
+		break;
+
+	default:
+		panic("unknown trap at pc=%#.8lux lr=%#.8lux", ureg->pc, ureg->r14);
+		break;
+	}
+
+out:
+	splhi();
+	if(user) {
+		if(up->procctl || up->nnote)
+			notify(ureg);
+
+		kexit(ureg);
+	}
+}
+
+void
+syscall(Ureg *ureg)
+{
+	char *e;
+	uintptr sp;
+	long ret;
+	int i, s;
+	ulong scallnr;
+	vlong startns, stopns;
+
+	if(!kenter(ureg))
+		panic("syscall: from kernel: pc=%#.8lux", ureg->pc);
+
+	m->syscall++;
+	up->insyscall = 1;
+	up->pc = ureg->pc;
+
+	scallnr = up->scallnr = ureg->r0;
+	sp = ureg->sp;
+
+	spllo();
+
+	up->nerrlab = 0;
+	ret = -1;
+	if(!waserror()) {
+		if(scallnr >= nsyscall) {
+			pprint("bad sys call number %lux pc %#lux", scallnr, ureg->pc);
+			postnote(up, 1, "sys: bad sys call", NDebug);
+			error(Ebadarg);
+		}
+
+		if(sp < (USTKTOP-BY2PG) || sp > (USTKTOP-sizeof(Sargs)-BY2WD)) {
+			validaddr(sp, sizeof(Sargs)+BY2WD, 0);
+			evenaddr(sp);
+		}
+
+		up->s = *((Sargs*)(sp + BY2WD));
+		up->psstate = sysctab[scallnr];
+		if (up->procctl == Proc_tracesyscall) {
+			syscallfmt(scallnr, ureg->pc, (va_list)up->s.args);
+			s = splhi();
+			up->procctl = Proc_stopme;
+			procctl();
+			splx(s);
+			startns = todget(nil);
+		}
+
+		ret = systab[scallnr]((va_list)up->s.args);
+		poperror();
+	} else {
+		e = up->syserrstr;
+		up->syserrstr = up->errstr;
+		up->errstr = e;
+	}
+
+	if(up->nerrlab) {
+		print("bad errstack [%lud]: %d extra\n", scallnr, up->nerrlab);
+		for (i = 0; i < NERR; i++)
+			print("sp=%lux pc=%lux\n", up->errlab[i].sp, up->errlab[i].pc);
+
+		panic("error stack");
+	}
+
+	ureg->r0 = ret;
+	if(up->procctl == Proc_tracesyscall) {
+		stopns = todget(nil);
+		sysretfmt(scallnr, (va_list)up->s.args, ret, startns, stopns);
+		s = splhi();
+		up->procctl = Proc_stopme;
+		procctl();
+		splx(s);
+	}
+
+	up->insyscall = 0;
+	up->psstate = 0;
+	if(scallnr == NOTED)
+		noted(ureg, *((ulong *)up->s.args));
+
+	if(scallnr != RFORK && (up->procctl || up->nnote)) {
+		splhi();
+		notify(ureg);
+	}
+
+	if(up->delaysched)
+		sched();
+
+	kexit(ureg);
+	splhi();
+}
+
+int
+probeaddr(uintptr a)
+{
+	static Lock l;
+	volatile ulong v;
+
+	ilock(&l);
 	probing = 1;
-	coherence();
+	probed = 1;
 
-	v = *(ulong *)addr;	/* this may cause a fault */
-	USED(probing);
-	coherence();
+	v = *(ulong*)a;
 
-	probing = 0;
 	coherence();
-	if (trapped)
-		v = -1;
-	iunlock(&fltlck);
-	return v;
+	if(!probed) {
+		iunlock(&l);
+		return 0;
+	}
+
+	iunlock(&l);
+	return 1;
 }

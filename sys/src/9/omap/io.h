@@ -1,82 +1,63 @@
-/*
- * the ``general-purpose'' memory controller.
- * only works with flash memory.
- */
+#define PHYSL4 0x40000000
+#define PHYSL4END 0x50000000
 
-enum {
-	/* syscfg bits */
-	Idlemask	= MASK(2) << 3,
-	Noidle		= 1 << 3,
+#define PHYSTIMER1 0x48318000
+#define PHYSTIMER2 0x49032000
+#define PHYSTIMER3 0x49034000
+#define PHYSTIMER4 0x49036000
+#define PHYSTIMER5 0x49038000
+#define PHYSTIMER6 0x4903a000
+#define PHYSTIMER7 0x4903c000
+#define PHYSTIMER8 0x4903e000
+#define PHYSTIMER9 0x49040000
+#define PHYSTIMER10 0x48086000
+#define PHYSTIMER11 0x48088000
 
-	/* config bits */
-	Postnandwrites	= 1<<0,	/* force nand reg. writes to be posted */
+#define PHYSUART1 0x4806a000
+#define PHYSUART2 0x4806c000
+#define PHYSUART3 0x49020000
 
-	/* indices of cscfg[].cfg[] */
-	Csctl		= 1 - 1,		/* chip-select signal ctl */
-	Csmap		= 7 - 1,		/* chip-select addr map cfg */
+#define PHYSI2C1 0x48070000
+#define PHYSI2C2 0x48072000
+#define PHYSI2C3 0x48060000
 
-	/* Csctl bits */
-	Muxadddata	= 1 << 9,
-	Devtypemask	= MASK(2) << 10,
-	Devtypenor	= 0 << 10,
-	Devtypenand	= 2 << 10,
-	Devsizemask	= 1 << 12,
-	Devsize8	= 0 << 12,
-	Devsize16	= 1 << 12,
-	Writesync	= 1 << 27,
-	Readsync	= 1 << 29,
+#define PHYSMMC1 0x4809c000
+#define PHYSMMC2 0x480b4000
+#define PHYSMMC3 0x480ad000
 
-	/* Csmap bits */
-	Csvalid		= 1 << 6,
-	MB16		= 017 << 8,		/* 16MB size */
-	MB128		= 010 << 8,		/* 128MB size */
-};
+#define PHYSDSS 0x48050000
 
-typedef struct Gpmc Gpmc;
-typedef struct Gpmccs Gpmccs;
+#define PHYSINTRMODEM 0x480c7000
+#define PHYSINTRMPU 0x48200000
 
-/*
- * configuration for non-dram (e.g., flash) memory
- */
-struct Gpmc {				/* hw registers */
-	uchar	_pad0[0x10];
-	ulong	syscfg;
-	ulong	syssts;
-	ulong	irqsts;
-	ulong	irqenable;
-	uchar	_pad1[0x40 - 0x20];
-	ulong	tmout_ctl;
-	ulong	erraddr;
-	ulong	errtype;
-	ulong	_pad7;
-	ulong	config;
-	ulong	sts;
-	uchar	_pad2[0x60 - 0x58];
+#define PHYSL3 0x68000000
+#define PHYSL3END 0x70000000
 
-	/* chip-select config */
-	struct Gpmccs {
-		ulong	cfg[7];
-		ulong	nandcmd;
-		ulong	nandaddr;
-		ulong	nanddata;
-		ulong	_pad6[2];
-	} cscfg[8];
+#define PHYSMEM 0x80000000
+#define PHYSMEMEND 0x90000000
 
-	/* prefetch */
-	ulong	prefcfg[2];
-	ulong	_pad8;
-	ulong	prefctl;
-	ulong	prefsts;
+#define IRQTIMER1 37
+#define IRQTIMER2 38
+#define IRQTIMER3 39
+#define IRQTIMER4 40
+#define IRQTIMER5 41
+#define IRQTIMER6 42
+#define IRQTIMER7 43
+#define IRQTIMER8 44
+#define IRQTIMER9 45
+#define IRQTIMER10 46
+#define IRQTIMER11 47
 
-	/* ecc */
-	ulong	ecccfg;
-	ulong	eccctl;
-	ulong	eccsize;
-	ulong	eccres[9];
-	uchar	_pad3[0x240 - 0x224];
+#define IRQUART1 72
+#define IRQUART2 73
+#define IRQUART3 74
 
-	/* bch */
-	ulong	bchres[8][4];
-	uchar	_pad4[0x2d0 - 0x2c0];
-	ulong	bchswdata;
-};
+#define IRQI2C1 56
+#define IRQI2C2 57
+#define IRQI2C3 61
+
+#define IRQMMC1 83
+#define IRQMMC2 86
+#define IRQMMC3 94
+
+#define IRQTWL 7

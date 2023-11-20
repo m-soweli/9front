@@ -1,609 +1,331 @@
-/*
- * ti omap35 display subsystem (dss)
- *
- * can handle 2ⁿ bits per pixel for 0 < n ≤ 4, and 12 and 24 bits.
- * can handle	1024×768 at 60 Hz with pixel clock of 63.5 MHz
- *		1280×800 at 59.91 Hz with pixel clock of 71 MHz
- *		1400×1050 lcd at 50 MHz with pixel clock of 75 MHz
- * has 256 24-bit entries in RGB palette
- */
 #include "u.h"
 #include "../port/lib.h"
 #include "mem.h"
 #include "dat.h"
 #include "fns.h"
 #include "io.h"
-#include "ureg.h"
-#include "../port/error.h"
 
-#define	Image	IMAGE
+#define Image IMAGE
 #include <draw.h>
 #include <memdraw.h>
-#include <cursor.h>
 #include "screen.h"
-// #include "gamma.h"
 
 enum {
-	Tabstop	= 4,		/* should be 8 */
-	Scroll	= 8,		/* lines to scroll at one time */
-	/*
-	 * screen settings for Wid and Ht, should a bit more dynamic?
-	 * http://www.epanorama.net/faq/vga2rgb/calc.html
-	 * used to calculate settings.
-	 */
+	/* display controller registers */
+	RDrev			= 0x400,
+	RDsysconf		= 0x410,
+	RDsysstat		= 0x414,
+	RDirqstat		= 0x418,
+	RDirqen			= 0x41c,
+	RDcontrol		= 0x440,
+		DClcdon			= 1<<0,
+		DClcdgo			= 1<<5,
+	RDconfig		= 0x444,
+	RDdefcolor		= 0x44c,
+	RDtranscolor	= 0x454,
+	RDlinestat		= 0x45c,
+	RDlineintr		= 0x460,
+	RDtimeh			= 0x464,
+	RDtimev			= 0x468,
+	RDsize			= 0x47c,
 
-//	Hbp     = (248-1) << 20,
-//	Hfp     = (48-1) << 8,
-//	Hsw     = 112-1,
-
-//	Vbp     = 38 << 20,
-//	Vfp     = 1 << 8,
-//	Vsw     = 3,
-
-	Tft	= 0x60,
-
-	Loadmode = 2 << 1,
-	Fifosize = 0x400,
-
-	/* dispc sysconfig */
-	Midlemode	= 2 << 12,
-	Sidlemode	= 2 << 3,
-	EnableWakeup	= 1 << 2,
-	Autoidle	= 1 << 0,
-
-	/* dispc pool_freq */
-	Ipc		= 1 << 14,
-	Ihs		= 1 << 13,
-	Ivs		= 1 << 12,
-	Acb		= 0x28,
-
-	/* gfx attribs */
-	Burstsize	= 2 << 6,
-	Format		= 6 << 1,
-	Gfxenable	= 1 << 0,
-
-	/* dispc control */
-	Gpout1		= 1 << 16,
-	Gpout0		= 1 << 15,
-	Tftdata		= 3 << 8,
-	Digital		= 1 << 6,
-	Lcd		= 1 << 5,
-	Stntft		= 1 << 3,
-	Digitalen	= 1 << 1,
-//	Lcden		= 1 << 0,	/* unused */
+	/* display controller graphics layer registers */
+	RDgfxba				= 0x480,
+	RDgfxpos			= 0x488,
+	RDgfxsize			= 0x48c,
+	RDgfxattr			= 0x4a0,
+		DCgfxattrfmt		= 0xf<<1,
+		DCgfxattrfmt16		= 0x6<<1,
+	RDgfxrowinc			= 0x4ac,
+	RDgfxpixelinc		= 0x4b0,
 };
 
-typedef struct Dispcregs Dispc;
-typedef struct Dssregs Dss;
-typedef struct Ioregs Ioregs;
-
-struct Ioregs {				/* common registers, 68 (0x44) bytes */
-	ulong 	rev;
-	uchar	_pad0[0x10-0x4];
-	ulong	sysconf;
-	ulong	sysstat;
-	ulong	irqstat1;
-
-	/* Dispc only regs */
-	ulong	irqen1;
-	ulong	wkupen;
-	ulong	_pad1;
-	ulong	irqsts2;
-	ulong	irqen2;
-	ulong	_pad2[4];
-
-	ulong	ctrl;
+enum {
+	Tab	= 4,
+	Scroll = 8,
 };
 
-struct Dssregs {			/* display subsys at 0x48050000 */
-	Ioregs;
-	ulong	sdicrtl;
-	ulong	pllcrtl;
-	uchar	_pad3[0x5c-0x4c];
-	ulong	sdistat;
+typedef struct Ctlr Ctlr;
+struct Ctlr {
+	Lock;
+
+	u32int *io;
+
+	Memdata scrdata;
+	Memimage *scrimg;
+	Memsubfont *scrfont;
+
+	Rectangle win;
+	Point font;
+	Point pos;
 };
 
-struct Dispcregs {			/* display ctlr at 0x48050400 */
-	Ioregs;
-	ulong	config;
-	ulong	_pad3;
-	ulong 	defaultcolor[2];
-	ulong	transcolor[2];
-	ulong	linestat;
-	ulong	linenum;
-	ulong	timing_h;
-	ulong	timing_v;
-	ulong	pol_req;
-	ulong	divisor;
-	ulong	alpha;
-	ulong	digsize;
-	ulong	lcdsize;
-
-	ulong	base[2];	/* should allocate both to avoid dithering */
-	ulong	pos;
-	ulong	size;
-	ulong	_pad4[4];
-	ulong	attrib;
-	ulong	fifothr;
-	ulong	fifosize;
-	ulong	rowinc;
-	ulong	pixelinc;
-	ulong	winskip;
-	ulong	palette;		/* gfx_table_ba */
-	uchar	_pad5[0x5d4 - 0x4bc];
-
-	ulong	datacycle[3];
-	uchar	_pad5[0x620 - 0x5e0];
-
-	ulong	cprcoefr;
-	ulong	cprcoefg;
-	ulong	cprcoefb;
-	ulong	preload;
+static Ctlr ctlr = {
+	.io = (u32int*) PHYSDSS,
 };
 
-OScreen oscreen;
-Settings settings[] = {
-[Res800x600]   {  800,  600, 60, RGB16,  40000,	 88, 40, 128,	23, 1, 5, },
-[Res1024x768]  { 1024,  768, 60, RGB16,  65000,	160, 24, 136,	29, 3, 7, },
-[Res1280x1024] { 1280, 1024, 60, RGB16, 108000,	248, 48, 112,	38, 1, 4, },
-[Res1400x1050] { 1400, 1050, 50, RGB16, 108000, 248, 48, 112,	38, 1, 4, }, // TODO
-};
-Omap3fb *framebuf;
-Memimage *gscreen;
+#define csr32r(c, r) ((c)->io[(r)/4])
+#define csr32w(c, r, w) ((c)->io[(r)/4] = (w))
 
-static Memdata xgdata;
+static void myscreenputs(char *s, int n);
 
-static Memimage xgscreen =
+static int
+screendatainit(Ctlr *ctlr, uint x, uint y)
 {
-	{ 0, 0, Wid, Ht },	/* r */
-	{ 0, 0, Wid, Ht },	/* clipr */
-	Depth,			/* depth */
-	3,			/* nchan */
-	RGB16,			/* chan */
-	nil,			/* cmap */
-	&xgdata,		/* data */
-	0,			/* zero */
-	Wid*(Depth/BI2BY)/BY2WD, /* width in words of a single scan line */
-	0,			/* layer */
-	0,			/* flags */
-};
+	Rectangle r;
 
-static Memimage *conscol;
-static Memimage *back;
+	if(memimageinit() < 0)
+		return -1;
 
-static Memsubfont *memdefont;
+	r = Rect(0, 0, x, y);
+	ctlr->scrdata.ref = 1;
+	ctlr->scrdata.bdata = ucalloc(r.max.x * r.max.y * 2);
+	if(!ctlr->scrdata.bdata)
+		return -1;
 
-static Lock screenlock;
+	ctlr->scrimg = allocmemimaged(r, RGB16, &ctlr->scrdata);
+	if(!ctlr->scrimg)
+		return -1;
 
-static Point	curpos;
-static int	h, w;
-static int	landscape = 0;	/* screen orientation, default is 0: portrait */
-static ushort	*vscreen;	/* virtual screen */
-static Rectangle window;
+	ctlr->scrfont = getmemdefont();
+	return 0;
+}
 
-static Dispc *dispc = (Dispc *)PHYSDISPC;
-static Dss *dss	= (Dss *)PHYSDSS;
-
-static	void	omapscreenputs(char *s, int n);
-static	ulong	rep(ulong, int);
-static	void	screenputc(char *buf);
-static	void	screenwin(void);
-
-static void
-lcdoff(void)
+static Memimage*
+screenmkcolor(Memimage *scr, ulong color)
 {
-	dispc->ctrl &= ~1;		/* disable the lcd */
-	coherence();
+	Memimage *i;
 
-	dispc->irqstat1 |= 1;		/* set framedone */
-	coherence();
+	i = allocmemimage(Rect(0, 0, 1, 1), scr->chan);
+	if(i) {
+		i->flags |= Frepl;
+		i->clipr = scr->r;
+		memfillcolor(i, color);
+	}
 
-	/* the lcd never comes ready, so don't bother with this */
-#ifdef notdef
-	/* spin until the frame is complete, but not forever */
-	for(cnt = 50; !(dispc->irqstat1 & 1) && cnt-- > 0; )
-		delay(10);
-#endif
-	delay(20);			/* worst case for 1 frame, 50Hz */
+	return i;
 }
 
 static void
-dssstart(void)
+screenwin(Ctlr *ctlr)
 {
-	/* should reset the dss system */
-	dss->sysconf |= 1;
-	coherence();
+	Rectangle r;
+	Memimage *i;
+	Point p;
+	int h;
+
+	ctlr->font.y = h = ctlr->scrfont->height;
+	ctlr->font.x = ctlr->scrfont->info[' '].width;
+	
+	r = ctlr->scrimg->r;
+	if(i = screenmkcolor(ctlr->scrimg, 0x0D686BFF)) {
+		memimagedraw(ctlr->scrimg, r, i, ZP, memopaque, ZP, S);
+		freememimage(i);
+	}
+
+	r = insetrect(r, 16); memimagedraw(ctlr->scrimg, r, memblack, ZP, memopaque, ZP, S);
+	r = insetrect(r, 4); memimagedraw(ctlr->scrimg, r, memwhite, ZP, memopaque, ZP, S);
+	if(i = screenmkcolor(ctlr->scrimg, 0xaaaaaaff)) {
+		memimagedraw(ctlr->scrimg, Rpt(r.min, Pt(r.max.x, r.min.y+h+12)), i, ZP, memopaque, ZP, S);
+		freememimage(i);
+
+		r = insetrect(r, 6);
+		p = r.min;
+		memimagestring(ctlr->scrimg, p, memblack, ZP, ctlr->scrfont, " Plan 9 Console ");
+	}
+
+	ctlr->win = Rpt(addpt(r.min, Pt(0, h + 6)), subpt(r.max, Pt(6, 6)));
+	ctlr->pos = ctlr->win.min;
+	screenputs = myscreenputs;
 }
 
-/* see spruf98i §15.6.7.4.2 */
-static void
-configdispc(void)
-{
-	Settings *sp;
-
-	sp = oscreen.settings;
-	dss->ctrl &= 0x78;		/* choose dss clock */
-	dispc->sysconf = Midlemode | Sidlemode | EnableWakeup | Autoidle;
-	dispc->config = Loadmode;
-	coherence();
-
-	/* pll */
-	dispc->defaultcolor[0] = 0;	/* set background color to black? */
-	dispc->defaultcolor[1] = 0;
-	dispc->transcolor[0] = 0;	/* set transparency to full */
-	dispc->transcolor[1] = 0;
-
-	dispc->timing_h = (sp->hbp-1) << 20 | (sp->hfp-1) << 8 |
-			(sp->hsw-1);
-	dispc->timing_v = sp->vbp << 20 | sp->vfp << 8 |
-			(sp->vsw-1);
-
-	dispc->pol_req = Ipc | Ihs | Ivs | Acb;
-	dispc->divisor = 1 << 16 | ((432000+sp->pixelclock-1)/sp->pixelclock);
-
-	dispc->lcdsize = (sp->ht - 1) << 16 | (sp->wid - 1);
-	coherence();
-
-	dispc->base[0] = PADDR(framebuf->pixel);
-	dispc->base[1] = PADDR(framebuf->pixel);
-
-	dispc->pos = 0;			/* place screen in the left corner */
-	/* use the whole screen */
-	dispc->size = (sp->ht - 1) << 16 | (sp->wid - 1);
-
-	/* what mode does plan 9 use for fb? */
-	dispc->attrib = Burstsize | Format | Gfxenable;
-
-	dispc->preload = Tft;
-	dispc->fifosize = Fifosize;
-	/* 1008 is max for our Burstsize */
-	dispc->fifothr = (Fifosize - 1) << 16 | (1008 - 1);
-
-	/* 1 byte is one pixel (not true, we use 2 bytes per pixel) */
-	dispc->rowinc = 1;
-	dispc->pixelinc = 1;
-	dispc->winskip = 0;		/* don't skip anything */
-	coherence();
-
-	// dispc->palette = PADDR(framebuf->palette);
-}
-
-static void
-lcdon(int enable)
-{
-	dispc->ctrl = Gpout1 | Gpout0 | Tftdata | Digital | Lcd | Stntft |
-		Digitalen | enable;
-	coherence();
-	delay(10);
-}
-
-static void
-lcdstop(void)
-{
-	configscreengpio();
-	screenclockson();
-
-	lcdoff();
-}
-
-static void
-lcdinit(void)
-{
-	lcdstop();
-
-	dssstart();
-	configdispc();
-}
-
-/* Paint the image data with blue pixels */
-void
-screentest(void)
-{
-	int i;
-
-	for (i = nelem(framebuf->pixel) - 1; i >= 0; i--)
-		framebuf->pixel[i] = 0x1f;			/* blue */
-//	memset(framebuf->pixel, ~0, sizeof framebuf->pixel);	/* white */
-}
-
-void
-screenpower(int on)
-{
-	blankscreen(on == 0);
-}
-
-/* called from devmouse */
-
-void
-cursoron(void)
-{
-	swcursorhide(0);
-	swcursordraw(mousexy());
-}
-
-void
-cursoroff(void)
-{
-	swcursorhide(0);
-}
-
-void
-setcursor(Cursor* curs)
-{
-	oscreen.Cursor = *curs;
-	swcursorload(curs);
-}
-
-/* called from main and possibly later from devdss to change resolution */
 void
 screeninit(void)
 {
-	static int first = 1;
+	Ctlr *c;
+	uint x, y;
 
-	if (first) {
-		iprint("screeninit...");
-		oscreen.settings = &settings[Res1280x1024];
-
-		lcdstop();
-		if (framebuf)
-			free(framebuf);
-		/* mode is 16*32 = 512 */
-		framebuf = xspanalloc(sizeof *framebuf, 16*32, 0);
-	}
-
-	lcdinit();
-	lcdon(1);
-	if (first) {
-		memimageinit();
-		memdefont = getmemdefont();
-		screentest();
-	}
-
-	xgdata.ref = 1;
-	xgdata.bdata = (uchar *)framebuf->pixel;
-
-	gscreen = &xgscreen;
-	gscreen->r = Rect(0, 0, Wid, Ht);
-	gscreen->clipr = gscreen->r;
-	/* width, in words, of a single scan line */
-	gscreen->width = Wid * (Depth / BI2BY) / BY2WD;
-	flushmemscreen(gscreen->r);
-
-	if (first) {
-		iprint("on: blue for 3 seconds...");
-		delay(3*1000);
-		iprint("\n");
-
-		screenwin();		/* draw border & top orange bar */
-		screenputs = omapscreenputs;
-		iprint("screen: frame buffer at %#p for %dx%d\n",
-			framebuf, oscreen.settings->wid, oscreen.settings->ht);
-
-		swcursorinit();		/* needs gscreen set */
-		first = 0;
-	}
-}
-
-/* flushmemscreen should change buffer? */
-void
-flushmemscreen(Rectangle r)
-{
-	ulong start, end;
-
-	if (r.min.x < 0)
-		r.min.x = 0;
-	if (r.max.x > Wid)
-		r.max.x = Wid;
-	if (r.min.y < 0)
-		r.min.y = 0;
-	if (r.max.y > Ht)
-		r.max.y = Ht;
-	if (rectclip(&r, gscreen->r) == 0)
+	c = &ctlr;
+	if((csr32r(c, RDgfxattr) & DCgfxattrfmt) != DCgfxattrfmt16)
 		return;
-	start = (ulong)&framebuf->pixel[r.min.y*Wid + r.min.x];
-	end   = (ulong)&framebuf->pixel[(r.max.y - 1)*Wid + r.max.x -1];
-	cachedwbse((ulong *)start, end - start);
+
+	x = ((csr32r(c, RDgfxsize) & 0x0000ffff) >> 0) + 1;;
+	y = ((csr32r(c, RDgfxsize) & 0xffff0000) >> 16) + 1;
+	if(screendatainit(c, x, y) < 0)
+		return;
+
+	screenwin(c);
+	screenputs(kmesg.buf, kmesg.n);
+
+	csr32w(c, RDgfxba, (uintptr) c->scrdata.bdata);
+	csr32w(c, RDcontrol, csr32r(c, RDcontrol) | DClcdgo | DClcdon);
+	conf.monitor = 1;
 }
 
-/*
- * export screen to devdraw
- */
-Memdata*
-attachscreen(Rectangle *r, ulong *chan, int* d, int *width, int *softscreen)
+static void
+screenscroll(Ctlr *ctlr)
 {
-	if(gscreen == nil)
+	int o, h;
+	Point p;
+	Rectangle r;
+
+	h = ctlr->font.y;
+	o = Scroll * h;
+	r = Rpt(ctlr->win.min, Pt(ctlr->win.max.x, ctlr->win.max.y - o));
+	p = Pt(ctlr->win.min.x, ctlr->win.min.y + o);
+	memimagedraw(ctlr->scrimg, r, ctlr->scrimg, p, nil, p, S);
+	flushmemscreen(r);
+
+	r = Rpt(Pt(ctlr->win.min.x, ctlr->win.max.y - o), ctlr->win.max);
+	memimagedraw(ctlr->scrimg, r, memwhite, ZP, nil, ZP, S);
+	flushmemscreen(r);
+
+	ctlr->pos.y -= o;
+	
+}
+
+static void
+screenputc(Ctlr *ctlr, char *buf)
+{
+	Point p;
+	Rectangle r;
+	uint chr;
+	int w, h;
+	static int *xp;
+	static int xbuf[256];
+
+	w = ctlr->font.x;
+	h = ctlr->font.y;
+	if(xp < xbuf || xp >= &xbuf[nelem(xbuf)])
+		xp = xbuf;
+
+	switch(buf[0]) {
+	case '\n':
+		if(ctlr->pos.y + h >= ctlr->win.max.y)
+			screenscroll(ctlr);
+
+		ctlr->pos.y += h;
+		screenputc(ctlr, "\r");
+		break;
+
+	case '\r':
+		xp = xbuf;
+		ctlr->pos.x = ctlr->win.min.x;
+		break;
+
+	case '\t':
+		if(ctlr->pos.x >= ctlr->win.max.x - 4 * w)
+			screenputc(ctlr, "\n");
+
+		chr = (ctlr->pos.x - ctlr->win.min.x) / w;
+		chr = Tab - chr % Tab;
+		*xp++ = ctlr->pos.x;
+
+		r = Rect(ctlr->pos.x, ctlr->pos.y, ctlr->pos.x + chr * w, ctlr->pos.y + h);
+		memimagedraw(ctlr->scrimg, r, memwhite, ZP, memopaque, ZP, S);
+		flushmemscreen(r);
+		ctlr->pos.x += chr * w;
+		break;
+
+	case '\b':
+		if(xp <= xbuf)
+			break;
+
+		xp--;
+		r = Rect(*xp, ctlr->pos.y, ctlr->pos.x, ctlr->pos.y + h);
+		memimagedraw(ctlr->scrimg, r, memwhite, ZP, memopaque, ZP, S);
+		ctlr->pos.x = *xp;
+		break;
+
+	case '\0':
+		break;
+
+	default:
+		p = memsubfontwidth(ctlr->scrfont, buf); w = p.x;
+		if(ctlr->pos.x >= ctlr->win.max.x - w)
+			screenputc(ctlr, "\n");
+
+		*xp++ = ctlr->pos.x;
+		r = Rect(ctlr->pos.x, ctlr->pos.y, ctlr->pos.x + w, ctlr->pos.y + h);
+		memimagedraw(ctlr->scrimg, r, memwhite, ZP, memopaque, ZP, S);
+		memimagestring(ctlr->scrimg, ctlr->pos, memblack, ZP, ctlr->scrfont, buf);
+		ctlr->pos.x += w;
+		break;
+	}
+}
+
+static void
+myscreenputs(char *s, int n)
+{
+	Ctlr *c;
+	Rune r;
+	int i;
+	char buf[UTFmax];
+
+	c = &ctlr;
+	if(!c->scrimg)
+		return;
+
+	if(!islo()) {
+		/* don't deadlock trying to print in an interrupt */
+		if(!canlock(c))
+			return;
+	} else {
+		lock(c);
+	}
+
+	while(n > 0) {
+		i = chartorune(&r, s);
+		if(i == 0) {
+			s++; n--;
+			continue;
+		}
+
+		memmove(buf, s, i);
+		buf[i] = 0;
+		s += i; n -= i;
+		screenputc(c, buf);
+	}
+
+	unlock(c);
+}
+
+Memdata*
+attachscreen(Rectangle *r, ulong *chan, int *d, int *width, int *softscreen)
+{
+	Ctlr *c;
+
+	c = &ctlr;
+	if(!c->scrimg)
 		return nil;
 
-	*r = gscreen->r;
-	*d = gscreen->depth;
-	*chan = gscreen->chan;
-	*width = gscreen->width;
-	*softscreen = (landscape == 0);
+	*r = c->scrimg->r;
+	*d = c->scrimg->depth;
+	*chan = c->scrimg->chan;
+	*width = c->scrimg->width;
+	*softscreen = 1;
 
-	gscreen->data->ref++;
-	return gscreen->data;
+	c->scrdata.ref++;
+	return &c->scrdata;
 }
 
 void
-getcolor(ulong p, ulong *pr, ulong *pg, ulong *pb)
+getcolor(ulong, ulong *, ulong *, ulong *)
 {
-	USED(p, pr, pg, pb);
 }
 
 int
-setcolor(ulong p, ulong r, ulong g, ulong b)
+setcolor(ulong, ulong, ulong, ulong)
 {
-	USED(p, r, g, b);
 	return 0;
 }
 
 void
-blankscreen(int blank)
+flushmemscreen(Rectangle)
 {
-	if (blank)
-		lcdon(0);
-	else {
-		lcdinit();
-		lcdon(1);
-	}
 }
 
-static void
-omapscreenputs(char *s, int n)
+void
+mouseresize(void)
 {
-	int i;
-	Rune r;
-	char buf[4];
-
-	if (!islo()) {
-		/* don't deadlock trying to print in interrupt */
-		if (!canlock(&screenlock))
-			return;			/* discard s */
-	} else
-		lock(&screenlock);
-
-	while (n > 0) {
-		i = chartorune(&r, s);
-		if (i == 0) {
-			s++;
-			--n;
-			continue;
-		}
-		memmove(buf, s, i);
-		buf[i] = 0;
-		n -= i;
-		s += i;
-		screenputc(buf);
-	}
-	unlock(&screenlock);
-}
-
-static void
-screenwin(void)
-{
-	char *greet;
-	Memimage *orange;
-	Point p, q;
-	Rectangle r;
-
-	memsetchan(gscreen, RGB16);
-
-	back = memwhite;
-	conscol = memblack;
-
-	orange = allocmemimage(Rect(0, 0, 1, 1), RGB16);
-	orange->flags |= Frepl;
-	orange->clipr = gscreen->r;
-	orange->data->bdata[0] = 0x40;		/* magic: colour? */
-	orange->data->bdata[1] = 0xfd;		/* magic: colour? */
-
-	w = memdefont->info[' '].width;
-	h = memdefont->height;
-
-	r = insetrect(gscreen->r, 4);
-
-	memimagedraw(gscreen, r, memblack, ZP, memopaque, ZP, S);
-	window = insetrect(r, 4);
-	memimagedraw(gscreen, window, memwhite, ZP, memopaque, ZP, S);
-
-	memimagedraw(gscreen, Rect(window.min.x, window.min.y,
-		window.max.x, window.min.y + h + 5 + 6), orange, ZP, nil, ZP, S);
-	freememimage(orange);
-	window = insetrect(window, 5);
-
-	greet = " Plan 9 Console ";
-	p = addpt(window.min, Pt(10, 0));
-	q = memsubfontwidth(memdefont, greet);
-	memimagestring(gscreen, p, conscol, ZP, memdefont, greet);
-	flushmemscreen(r);
-	window.min.y += h + 6;
-	curpos = window.min;
-	window.max.y = window.min.y + ((window.max.y - window.min.y) / h) * h;
-}
-
-static void
-scroll(void)
-{
-	int o;
-	Point p;
-	Rectangle r;
-
-	/* move window contents up Scroll text lines */
-	o = Scroll * h;
-	r = Rpt(window.min, Pt(window.max.x, window.max.y - o));
-	p = Pt(window.min.x, window.min.y + o);
-	memimagedraw(gscreen, r, gscreen, p, nil, p, S);
-	flushmemscreen(r);
-
-	/* clear the bottom Scroll text lines */
-	r = Rpt(Pt(window.min.x, window.max.y - o), window.max);
-	memimagedraw(gscreen, r, back, ZP, nil, ZP, S);
-	flushmemscreen(r);
-
-	curpos.y -= o;
-}
-
-static void
-screenputc(char *buf)
-{
-	int w;
-	uint pos;
-	Point p;
-	Rectangle r;
-	static int *xp;
-	static int xbuf[256];
-
-	if (xp < xbuf || xp >= &xbuf[nelem(xbuf)])
-		xp = xbuf;
-
-	switch (buf[0]) {
-	case '\n':
-		if (curpos.y + h >= window.max.y)
-			scroll();
-		curpos.y += h;
-		screenputc("\r");
-		break;
-	case '\r':
-		xp = xbuf;
-		curpos.x = window.min.x;
-		break;
-	case '\t':
-		p = memsubfontwidth(memdefont, " ");
-		w = p.x;
-		if (curpos.x >= window.max.x - Tabstop * w)
-			screenputc("\n");
-
-		pos = (curpos.x - window.min.x) / w;
-		pos = Tabstop - pos % Tabstop;
-		*xp++ = curpos.x;
-		r = Rect(curpos.x, curpos.y, curpos.x + pos * w, curpos.y + h);
-		memimagedraw(gscreen, r, back, back->r.min, nil, back->r.min, S);
-		flushmemscreen(r);
-		curpos.x += pos * w;
-		break;
-	case '\b':
-		if (xp <= xbuf)
-			break;
-		xp--;
-		r = Rect(*xp, curpos.y, curpos.x, curpos.y + h);
-		memimagedraw(gscreen, r, back, back->r.min, nil, back->r.min, S);
-		flushmemscreen(r);
-		curpos.x = *xp;
-		break;
-	case '\0':
-		break;
-	default:
-		p = memsubfontwidth(memdefont, buf);
-		w = p.x;
-
-		if (curpos.x >= window.max.x - w)
-			screenputc("\n");
-
-		*xp++ = curpos.x;
-		r = Rect(curpos.x, curpos.y, curpos.x + w, curpos.y + h);
-		memimagedraw(gscreen, r, back, back->r.min, nil, back->r.min, S);
-		memimagestring(gscreen, curpos, conscol, ZP, memdefont, buf);
-		flushmemscreen(r);
-		curpos.x += w;
-	}
 }

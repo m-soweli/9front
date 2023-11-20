@@ -3,239 +3,189 @@
 #include "mem.h"
 #include "dat.h"
 #include "fns.h"
+#include "io.h"
 
-#include "arm.h"
+static int debug = 0;
 
-#define L1X(va)		FEXT((va), 20, 12)
-#define L2X(va)		FEXT((va), 12, 8)
+#define L1(va) (((va)>>20) & 0xfff)
+#define L2(va) (((va)>>12) & 0xff)
+#define L1AP(ap) (((ap) << 10) & 0xff) /* dont care about ap[2] */
+#define L2AP(ap) (((ap) << 4) & 0xff)
 
 enum {
-	L1lo		= UZERO/MiB,		/* L1X(UZERO)? */
-	L1hi		= (USTKTOP+MiB-1)/MiB,	/* L1X(USTKTOP+MiB-1)? */
+	/* l1 descriptor type (arm v7 manual fig. 12.4) */
+	L1coarse = 1,
+	L1section = 2,
+	L1fine = 3,
+
+	/* l2 descriptor type (arm v7 manual fig. 12.5) */
+	L2large = 1,
+	L2small = 2,
+	L2tiny = 3,
+
+	Fnoexec = 1<<0,
+	Fbuffered = 1<<2,
+	Fcached = 1<<3,
+
+	APkrw = 1, /* kernel read write */
+	APuro = 2, /* user read only */
+	APurw = 3, /* user read write */
 };
 
-#define ISHOLE(pte)	((pte) == 0)
-
-/* dump level 1 page table at virtual addr l1 */
 void
-mmudump(PTE *l1)
+mmudebugl2(PTE *l2, uintptr va)
 {
-	int i, type, rngtype;
-	uintptr pa, startva, startpa;
-	uvlong va, endva;
-	PTE pte;
+	uintptr startpa, pa;
+	uintptr startva, endva;
+	int i, t;
 
-//	pa -= MACHSIZE+1024;	/* put level 2 entries below level 1 */
-//	l2 = KADDR(pa);
-
-	print("\n");
-	endva = startva = startpa = 0;
-	rngtype = 0;
-	/* dump first level of ptes */
-	for (va = i = 0; i < 4096; i++) {
-		pte = l1[i];
-		pa = pte & ~(MB - 1);
-		type = pte & (Fine|Section|Coarse);
-		if (ISHOLE(pte)) {
-			if (endva != 0) {	/* open range? close it */
-				print("l1 maps va (%#lux-%#llux) -> pa %#lux type %#ux\n",
-					startva, endva-1, startpa, rngtype);
+	t = 0;
+	startpa = 0;
+	startva = endva = 0;
+	for(i = 0; i < 256; i++) {
+		pa = l2[i] & ~((4*KiB)-1);
+		if(l2[i] == 0) {
+			if(endva) {
+				iprint("mmudebug: l2 type %#ux %#lux %#lux -> %#lux\n", t, startva, endva, startpa);
 				endva = 0;
 			}
 		} else {
-			if (endva == 0) {	/* no open range? start one */
+			if(!endva) {
 				startva = va;
 				startpa = pa;
-				rngtype = type;
+				t = l2[i] & (L2large | L2small | L2tiny);
 			}
-			endva = va + MB;	/* continue the open range */
-//			if (type == Coarse) {
-//				// could dump the l2 table for this l1 entry
-//			}
+
+			endva = va + (4*KiB);
 		}
+
+		va += (4*KiB);
+	}
+
+	if(endva)
+		iprint("mmudebug: l2 type %#ux %#lux %#lux -> %#lux\n", t, startva, endva, startpa);
+}
+
+void
+mmudebug(char *where)
+{
+	PTE *l1;
+	uintptr pa, startpa;
+	uintptr va, startva, endva;
+	int i, t;
+
+	if(!debug)
+		return;
+
+	iprint("mmudebug: %s pid %d\n", where, m->mmupid);
+
+	t = 0;
+	l1 = m->mmul1;
+	startpa = 0;
+	startva = endva = 0;
+	for(va = i = 0; i < 4096; i++) {
+		pa = l1[i] & ~(MiB-1);
+		if(l1[i] == 0) {
+			if(endva) {
+				iprint("mmudebug: l1 type %#ux %#lux %#lux -> %#lux\n", t, startva, endva, startpa);
+				endva = 0;
+			}
+		} else {
+			if(!endva) {
+				startva = va;
+				startpa = pa;
+				t = l1[i] & (L1coarse|L1section|L1fine);
+			}
+
+			if(t == L1coarse) {
+				mmudebugl2((PTE*) (l1[i] & ~(KiB-1)), startva);
+				endva = 0;
+			} else {
+				endva = va + MB;
+			}
+		}
+
 		va += MB;
 	}
-	if (endva != 0)			/* close an open range */
-		print("l1 maps va (%#lux-%#llux) -> pa %#lux type %#ux\n",
-			startva, endva-1, startpa, rngtype);
-}
 
-/* identity map the megabyte containing va, uncached */
-static void
-idmap(PTE *l1, ulong va)
-{
-	va &= ~(MB-1);
-	l1[L1X(va)] = va | Dom0 | L1AP(Krw) | Section;
-}
-
-/* map `mbs' megabytes from virt to phys */
-void
-mmumap(uintptr virt, uintptr phys, int mbs)
-{
-	uint off;
-	PTE *l1;
-
-	phys &= ~(MB-1);
-	virt &= ~(MB-1);
-	l1 = KADDR(ttbget());
-	for (off = 0; mbs-- > 0; off += MB)
-		l1[L1X(virt + off)] = (phys + off) | Dom0 | L1AP(Krw) | Section;
-	cacheuwbinv();
-	l2cacheuwbinv();
-	mmuinvalidate();
-}
-
-/* identity map `mbs' megabytes from phys */
-void
-mmuidmap(uintptr phys, int mbs)
-{
-	mmumap(phys, phys, mbs);
+	if(endva)
+		iprint("mmudebug: l1 type %#ux %#lux %#lux -> %#lux\n", t, startva, endva, startpa);
 }
 
 void
 mmuinit(void)
 {
-	uintptr pa;
-	PTE *l1, *l2;
-
-	pa = ttbget();
-	l1 = KADDR(pa);
-
-	/* redundant with l.s; only covers first MB of 17MB */
-	l1[L1X(VIRTIO)] = PHYSIO|Dom0|L1AP(Krw)|Section;
-
-	idmap(l1, PHYSETHER);		/* igep 9221 ethernet regs */
-	idmap(l1, PHYSL4PROT);
-	idmap(l1, PHYSL3);
-	idmap(l1, PHYSSMS);
-	idmap(l1, PHYSDRC);
-	idmap(l1, PHYSGPMC);
-
-	/* map high vectors to start of dram, but only 4K, not 1MB */
-	pa -= MACHSIZE+2*1024;
-	l2 = KADDR(pa);
-	memset(l2, 0, 1024);
-	/* vectors step on u-boot, but so do page tables */
-	l2[L2X(HVECTORS)] = PHYSDRAM|L2AP(Krw)|Small;
-	l1[L1X(HVECTORS)] = pa|Dom0|Coarse;	/* vectors -> ttb-machsize-2k */
-	coherence();
-
-	cacheuwbinv();
-	l2cacheuwbinv();
-	mmuinvalidate();
-
-	m->mmul1 = l1;
-//	mmudump(l1);			/* DEBUG */
+	m->mmul1 = (PTE*)MACHL1(m->machno);
 }
 
 static void
-mmul2empty(Proc* proc, int clear)
+mmul1empty(void)
+{
+	memset(m->mmul1, 0, (ROUND(USTKTOP, MiB)/MiB)*sizeof(PTE));
+}
+
+static void
+mmul2empty(Proc *proc, int clear)
 {
 	PTE *l1;
 	Page **l2, *page;
 
 	l1 = m->mmul1;
 	l2 = &proc->mmul2;
-	for(page = *l2; page != nil; page = page->next){
+	for(page = *l2; page != nil; page = page->next) {
 		if(clear)
 			memset((void*)page->va, 0, BY2PG);
-		l1[page->daddr] = Fault;
+
+		l1[page->daddr] = 0;
 		l2 = &page->next;
 	}
+
 	*l2 = proc->mmul2cache;
 	proc->mmul2cache = proc->mmul2;
 	proc->mmul2 = nil;
 }
 
-static void
-mmul1empty(void)
-{
-#ifdef notdef
-/* there's a bug in here */
-	PTE *l1;
-
-	/* clean out any user mappings still in l1 */
-	if(m->mmul1lo > L1lo){
-		if(m->mmul1lo == 1)
-			m->mmul1[L1lo] = Fault;
-		else
-			memset(&m->mmul1[L1lo], 0, m->mmul1lo*sizeof(PTE));
-		m->mmul1lo = L1lo;
-	}
-	if(m->mmul1hi < L1hi){
-		l1 = &m->mmul1[m->mmul1hi];
-		if((L1hi - m->mmul1hi) == 1)
-			*l1 = Fault;
-		else
-			memset(l1, 0, (L1hi - m->mmul1hi)*sizeof(PTE));
-		m->mmul1hi = L1hi;
-	}
-#else
-	memset(&m->mmul1[L1lo], 0, (L1hi - L1lo)*sizeof(PTE));
-#endif /* notdef */
-}
-
 void
-mmuswitch(Proc* proc)
+mmuswitch(Proc *proc)
 {
-	int x;
 	PTE *l1;
 	Page *page;
+	int l1x;
 
-	/* do kprocs get here and if so, do they need to? */
 	if(m->mmupid == proc->pid && !proc->newtlb)
 		return;
 	m->mmupid = proc->pid;
 
-	/* write back dirty and invalidate l1 caches */
-	cacheuwbinv();
+	/* write back and invalidate caches */
+	l1ucachewbinv();
+	l2ucachewbinv();
 
-	if(proc->newtlb){
+	if(proc->newtlb) {
 		mmul2empty(proc, 1);
 		proc->newtlb = 0;
 	}
 
 	mmul1empty();
 
-	/* move in new map */
+	/* switch to new map */
 	l1 = m->mmul1;
-	for(page = proc->mmul2; page != nil; page = page->next){
-		x = page->daddr;
-		l1[x] = PPN(page->pa)|Dom0|Coarse;
-		/* know here that L1lo < x < L1hi */
-		if(x+1 - m->mmul1lo < m->mmul1hi - x)
-			m->mmul1lo = x+1;
-		else
-			m->mmul1hi = x;
+	for(page = proc->mmul2; page != nil; page = page->next) {
+		l1x = page->daddr;
+		l1[l1x] = PPN(page->pa)|L1coarse;
 	}
 
-	/* make sure map is in memory */
-	/* could be smarter about how much? */
-	cachedwbse(&l1[L1X(UZERO)], (L1hi - L1lo)*sizeof(PTE));
-
-	/* lose any possible stale tlb entries */
+	/* FIXME: excessive invalidation */
+	l1ucachewbinv();
+	l2ucachewbinv();
 	mmuinvalidate();
-
-	//print("mmuswitch l1lo %d l1hi %d %d\n",
-	//	m->mmul1lo, m->mmul1hi, proc->kp);
+	mmudebug("mmuswitch");
 }
 
 void
-flushmmu(void)
+mmurelease(Proc *proc)
 {
-	int s;
-
-	s = splhi();
-	up->newtlb = 1;
-	mmuswitch(up);
-	splx(s);
-}
-
-void
-mmurelease(Proc* proc)
-{
-	/* write back dirty and invalidate l1 caches */
-	cacheuwbinv();
+	l1ucachewbinv();
+	l2ucachewbinv();
 
 	mmul2empty(proc, 0);
 
@@ -244,244 +194,118 @@ mmurelease(Proc* proc)
 
 	mmul1empty();
 
-	/* make sure map is in memory */
-	/* could be smarter about how much? */
-	cachedwbse(&m->mmul1[L1X(UZERO)], (L1hi - L1lo)*sizeof(PTE));
-
-	/* lose any possible stale tlb entries */
+	/* FIXME: excessive invalidation */
+	l1ucachewbinv();
+	l2ucachewbinv();
 	mmuinvalidate();
-}
-
-void
-putmmu(uintptr va, uintptr pa, Page* page)
-{
-	int x;
-	Page *pg;
-	PTE *l1, *pte;
-
-	x = L1X(va);
-	l1 = &m->mmul1[x];
-	//print("putmmu(%#p, %#p, %#p) ", va, pa, page->pa);
-	//print("mmul1 %#p l1 %#p *l1 %#ux x %d pid %d\n",
-	//	m->mmul1, l1, *l1, x, up->pid);
-	if(*l1 == Fault){
-		/* wasteful - l2 pages only have 256 entries - fix */
-		if(up->mmul2cache == nil){
-			/* auxpg since we don't need much? memset if so */
-			pg = newpage(1, 0, 0);
-			pg->va = VA(kmap(pg));
-		}
-		else{
-			pg = up->mmul2cache;
-			up->mmul2cache = pg->next;
-			memset((void*)pg->va, 0, BY2PG);
-		}
-		pg->daddr = x;
-		pg->next = up->mmul2;
-		up->mmul2 = pg;
-
-		/* force l2 page to memory */
-		cachedwbse((void *)pg->va, BY2PG);
-
-		*l1 = PPN(pg->pa)|Dom0|Coarse;
-		cachedwbse(l1, sizeof *l1);
-		//print("l1 %#p *l1 %#ux x %d pid %d\n", l1, *l1, x, up->pid);
-
-		if(x >= m->mmul1lo && x < m->mmul1hi){
-			if(x+1 - m->mmul1lo < m->mmul1hi - x)
-				m->mmul1lo = x+1;
-			else
-				m->mmul1hi = x;
-		}
-	}
-	pte = KADDR(PPN(*l1));
-	//print("pte %#p index %ld was %#ux\n", pte, L2X(va), *(pte+L2X(va)));
-
-	/* protection bits are
-	 *	PTERONLY|PTEVALID;
-	 *	PTEWRITE|PTEVALID;
-	 *	PTEWRITE|PTEUNCACHED|PTEVALID;
-	 */
-	x = Small;
-	if(!(pa & PTEUNCACHED))
-		x |= Cached|Buffered;
-	if(pa & PTEWRITE)
-		x |= L2AP(Urw);
-	else
-		x |= L2AP(Uro);
-	pte[L2X(va)] = PPN(pa)|x;
-	cachedwbse(&pte[L2X(va)], sizeof pte[0]);
-
-	/* clear out the current entry */
-	mmuinvalidateaddr(PPN(va));
-
-	/*  write back dirty entries - we need this because the pio() in
-	 *  fault.c is writing via a different virt addr and won't clean
-	 *  its changes out of the dcache.  Page coloring doesn't work
-	 *  on this mmu because the virtual cache is set associative
-	 *  rather than direct mapped.
-	 */
-	cachedwbinv();
-	if(needtxtflush(page)){
-		cacheiinv();
-		donetxtflush(page);
-	}
-	//print("putmmu %#p %#p %#p\n", va, pa, PPN(pa)|x);
+	mmudebug("mmurelease");
 }
 
 void*
-mmuuncache(void* v, usize size)
+mmuuncache(void *v, usize s)
 {
-	int x;
-	PTE *pte;
+	PTE *l1;
 	uintptr va;
 
-	/*
-	 * Simple helper for ucalloc().
-	 * Uncache a Section, must already be
-	 * valid in the MMU.
-	 */
-	va = (uintptr)v;
-	assert(!(va & (1*MiB-1)) && size == 1*MiB);
+	assert(!((uintptr)v & (MiB-1)) && s == MiB);
 
-	x = L1X(va);
-	pte = &m->mmul1[x];
-	if((*pte & (Fine|Section|Coarse)) != Section)
+	va = (uintptr)v;
+	l1 = &m->mmul1[L1(va)];
+	if((*l1 & (L1fine|L1section|L1coarse)) != L1section)
 		return nil;
-	*pte &= ~(Cached|Buffered);
-	mmuinvalidateaddr(va);
-	cachedwbinvse(pte, 4);
+
+	*l1 &= ~(Fbuffered|Fcached);
+
+	/* FIXME: excessive invalidation */
+	l1ucachewbinv();
+	l2ucachewbinv();
+	mmuinvalidate();
+	mmudebug("mmuuncache");
 
 	return v;
 }
 
-uintptr
-mmukmap(uintptr va, uintptr pa, usize size)
+void
+putmmu(uintptr va, uintptr pa, Page *page)
 {
-	int x;
-	PTE *pte;
+	int l1x, s, x;
+	PTE *l1, *l2;
+	Page *pg;
 
-	/*
-	 * Stub.
-	 */
-	assert(!(va & (1*MiB-1)) && !(pa & (1*MiB-1)) && size == 1*MiB);
+	l1x = L1(va);
+	l1 = &m->mmul1[l1x];
 
-	x = L1X(va);
-	pte = &m->mmul1[x];
-	if(*pte != Fault)
-		return 0;
-	*pte = pa|Dom0|L1AP(Krw)|Section;
-	mmuinvalidateaddr(va);
-	cachedwbinvse(pte, 4);
+	/* put l1 for l2 table if needed */
+	if(*l1 == 0) {
+		if(up->mmul2cache == nil) {
+			pg = newpage(1, 0, 0);
+			pg->va = VA(kmap(pg));
+		} else {
+			pg = up->mmul2cache;
+			up->mmul2cache = pg->next;
+			memset((void*)pg->va, 0, BY2PG);
+		}
 
-	return va;
+		pg->daddr = l1x;
+		pg->next = up->mmul2;
+		up->mmul2 = pg;
+
+		/* FIXME: excessive invalidation */
+		s = splhi();
+		*l1 = PPN(pg->pa)|L1coarse;
+		l1ucachewbinv();
+		l2ucachewbinv();
+		splx(s);
+	}
+
+	/* put l2 entry */
+	x = L2small;
+	if(!(pa & PTEUNCACHED))
+		x |= Fbuffered|Fcached;
+	if(pa & PTENOEXEC)
+		x |= Fnoexec;
+	if(pa & PTEWRITE)
+		x |= L2AP(APurw);
+	else
+		x |= L2AP(APuro);
+
+	l2 = KADDR(PPN(*l1)); l2[L2(va)] = PPN(pa)|x;
+
+	/* FIXME: excessive invalidation */
+	s = splhi();
+	l1ucachewbinv();
+	l2ucachewbinv();
+	if(needtxtflush(page)) {
+		l1icacheinv();
+		donetxtflush(page);
+	}
+
+	splx(s);
+	mmuinvalidate();
+	mmudebug("putmmu");
 }
 
-uintptr
-mmukunmap(uintptr va, uintptr pa, usize size)
+void
+checkmmu(uintptr, uintptr)
 {
-	int x;
-	PTE *pte;
-
-	/*
-	 * Stub.
-	 */
-	assert(!(va & (1*MiB-1)) && !(pa & (1*MiB-1)) && size == 1*MiB);
-
-	x = L1X(va);
-	pte = &m->mmul1[x];
-	if(*pte != (pa|Dom0|L1AP(Krw)|Section))
-		return 0;
-	*pte = Fault;
-	mmuinvalidateaddr(va);
-	cachedwbinvse(pte, 4);
-
-	return va;
+	/* this page is intentionally left blank */
 }
 
-/*
- * Return the number of bytes that can be accessed via KADDR(pa).
- * If pa is not a valid argument to KADDR, return 0.
- */
+void
+flushmmu(void)
+{
+	uint s;
+
+	s = splhi();
+	up->newtlb = 1; mmuswitch(up);
+	splx(s);
+}
+
 uintptr
 cankaddr(uintptr pa)
 {
-	if(pa >= PHYSDRAM && pa < PHYSDRAM+memsize)
-		return PHYSDRAM+memsize - pa;
+	if(pa >= PHYSMEM && pa < PHYSMEMEND)
+		return PHYSMEMEND-pa;
+
 	return 0;
 }
-
-/* from 386 */
-void*
-vmap(uintptr pa, usize size)
-{
-	uintptr pae, va;
-	usize o, osize;
-
-	/*
-	 * XXX - replace with new vm stuff.
-	 * Crock after crock - the first 4MB is mapped with 2MB pages
-	 * so catch that and return good values because the current mmukmap
-	 * will fail.
-	 */
-	if(pa+size < 4*MiB)
-		return (void*)(kseg0|pa);
-
-	osize = size;
-	o = pa & (BY2PG-1);
-	pa -= o;
-	size += o;
-	size = PGROUND(size);
-
-	va = kseg0|pa;
-	pae = mmukmap(va, pa, size);
-	if(pae == 0 || pae-size != pa)
-		panic("vmap(%#p, %ld) called from %#p: mmukmap fails %#p",
-			pa+o, osize, getcallerpc(&pa), pae);
-
-	return (void*)(va+o);
-}
-
-/* from 386 */
-void
-vunmap(void* v, usize size)
-{
-	/*
-	 * XXX - replace with new vm stuff.
-	 * Can't do this until do real vmap for all space that
-	 * might be used, e.g. stuff below 1MB which is currently
-	 * mapped automagically at boot but that isn't used (or
-	 * at least shouldn't be used) by the kernel.
-	upafree(PADDR(v), size);
-	 */
-	USED(v, size);
-}
-
-/*
- * Notes.
- * Everything is in domain 0;
- * domain 0 access bits in the DAC register are set
- * to Client, which means access is controlled by the
- * permission values set in the PTE.
- *
- * L1 access control for the kernel is set to 1 (RW,
- * no user mode access);
- * L2 access control for the kernel is set to 1 (ditto)
- * for all 4 AP sets;
- * L1 user mode access is never set;
- * L2 access control for user mode is set to either
- * 2 (RO) or 3 (RW) depending on whether text or data,
- * for all 4 AP sets.
- * (To get kernel RO set AP to 0 and S bit in control
- * register c1).
- * Coarse L1 page-tables are used. They have 256 entries
- * and so consume 1024 bytes per table.
- * Small L2 page-tables are used. They have 1024 entries
- * and so consume 4096 bytes per table.
- *
- * 4KiB. That's the size of 1) a page, 2) the
- * size allocated for an L2 page-table page (note only 1KiB
- * is needed per L2 page - to be dealt with later) and
- * 3) the size of the area in L1 needed to hold the PTEs
- * to map 1GiB of user space (0 -> 0x3fffffff, 1024 entries).
- */

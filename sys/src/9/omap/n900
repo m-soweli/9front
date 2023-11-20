@@ -1,0 +1,39 @@
+dev
+	root
+	cons
+	swap
+	env
+	pipe
+	proc
+	mnt
+	srv
+	shr
+	dup
+	tls
+	cap
+	sd
+	fs
+	dtracy
+
+	draw	screen
+
+	uart
+
+misc
+	uartomap
+
+	sdloop
+	sdram
+
+	dtracysys
+	dtracytimer
+	dtracydev
+
+port
+	int cpuserver = 0;
+
+bootdir
+	/$objtype/bin/paqfs
+	/$objtype/bin/auth/factotum
+	boot
+	bootfs.paq
